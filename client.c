@@ -9,13 +9,12 @@
 #include <signal.h>
 
 
-int sockfd, portno=5000, pid;
+int sockfd, pid;
 
 
-/*Function to handle ^C*/
+// function to handle ^C
 void sigCHandler() 
 { 
-	//WRITE YOUR CODE HERE
     char buffer[256] = "/quit\n";
     write(sockfd,buffer,sizeof(buffer));
     if (pid)
@@ -23,10 +22,9 @@ void sigCHandler()
 	exit(0);
 } 
 
-/*Function to handle ^Z*/
+// function to handle ^Z
 void sigZhandler() 
-{ 
-	//WRITE YOUR CODE HERE
+{
     char buffer[256] = "/quit\n";
     write(sockfd,buffer,sizeof(buffer));
     if (pid)
@@ -70,8 +68,8 @@ void ReceiveMessages()
 
 int main(int argc,char *argv[])
 {
-    signal(SIGINT, sigCHandler);  // handles ^C
-	signal(SIGTSTP, sigZhandler);    //handles ^Z
+    signal(SIGINT, sigCHandler);
+	signal(SIGTSTP, sigZhandler);
  
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     struct hostent *server;
@@ -85,10 +83,16 @@ int main(int argc,char *argv[])
     bzero((char *) &serv_addr, sizeof(serv_addr)); // initializes buffer
     serv_addr.sin_family = AF_INET; // for IPv4 family
     bcopy((char *)server->h_addr, (char *) &serv_addr.sin_addr.s_addr, server->h_length);
-    serv_addr.sin_port = htons(portno); //defining port number
+
+    char port[10] = "5000";
+	if (argc == 2)
+	{
+		strcpy(port, argv[1]);
+	}
+    serv_addr.sin_port = htons(atoi(port)); //defining port number
     if (connect(sockfd,(struct sockaddr *) &serv_addr,sizeof(serv_addr)) < 0)
     {
-         error("ERROR connecting");
+        perror("connect");
     }
     
     pid = fork();

@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/select.h>
 #include <sys/types.h> 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -15,8 +16,9 @@
 #include <sys/shm.h>
 #include <errno.h>
 
-#define P(s) semop(s, &pop, 1)  /* pop is the structure we pass for doing the P(s) operation */
-#define V(s) semop(s, &vop, 1)  /* vop is the structure we pass for doing the V(s) operation */
+///////////////////////////////////////////////////////////////////////////////////////////
+// Utils
+
 #define bool int
 #define true 1
 #define false 0
@@ -41,7 +43,11 @@ void push_back_##type(vector_##type* vec, type value) \
 \
 void free_vector_##type(vector_##type* vec) \
 { \
-    free(vec->a); \
+	if (vec->a) \
+	{ \
+		free(vec->a); \
+	} \
+	vec->a = NULL; \
 } \
 
 #define vector(type) \
@@ -67,7 +73,6 @@ void free_vector_##type(vector_##type* vec) \
 })
 
 define_vector(int)
-
 
 // convert string to int
 bool getInt(char* token, int* n)
@@ -124,7 +129,55 @@ bool getNext(char** pname, char token[])
     return true;
 }
 
-/*Define all the desired data structures as asked in the question*/
+///////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////
+// Semaphore
+
+int semId;
+struct sembuf pop = { .sem_num = 0, .sem_op = -1, .sem_flg = 0 };
+struct sembuf vop = { .sem_num = 0, .sem_op = 1, .sem_flg = 0 };
+
+#define P(s) semop(s, &(pop), 1)
+#define V(s) semop(s, &(vop), 1)
+
+void createAndInitSemaphore()
+{
+	// create 1 semaphore
+	if ((semId = semget(IPC_PRIVATE, 1, 0660 | IPC_CREAT)) == -1)
+	{
+		perror("semget");
+		exit(1);
+	}
+
+	union semun
+    {
+        int val;
+        struct semid_ds *buf;
+        unsigned short array[1];
+    } sem_attr;
+
+	sem_attr.val = 1; // semaphore initial value
+	if (semctl(semId, 0, SETVAL, sem_attr) == -1)
+	{
+        perror(" semctl SETVAL ");
+		exit(1);
+    }
+}
+
+void removeSemapohore()
+{
+	if (semctl(semId, 0, IPC_RMID) == -1)
+	{
+        perror("semctl IPC_RMID");
+		exit(1);
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////
+// Data Structures
 
 typedef struct client
 {
@@ -162,7 +215,37 @@ typedef struct group
 	vector_adminreq adminreqs;
 } group;
 
-int initGroup(group* g, int admin, int members[], int maxgroupsize)
+///////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////
+// Members
+
+client* clients;
+group* groups;
+int numconnections = 0;
+int numclients = 10;
+int numgroups = 10;
+int maxgroupsize = 5;
+int sockfd;
+fd_set master;
+int fdmax;
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////
+// Helper functions
+void cleanup()
+{
+	// free groups
+	for (int i = 0; i < numgroups; i++)
+	{
+		free_vector_int(&groups[i].requested_members);
+		free_vector_int(&groups[i].replies);
+		free_vector_adminreq(&groups[i].adminreqs);
+	}
+}
+
+int initGroup(group* g, int admin, int members[])
 {
 	g->gid = rand() % 89999 + 10000;
 	g->admins[0] = admin;
@@ -177,7 +260,7 @@ int initGroup(group* g, int admin, int members[], int maxgroupsize)
 	return g->gid;
 }
 
-int initGroupReq(group* g, int admin, vector_int* members, int maxgroupsize)
+int initGroupReq(group* g, int admin, vector_int* members)
 {
 	g->gid = rand() % 89999 + 10000;
 	g->admins[0] = admin;
@@ -194,7 +277,7 @@ int initGroupReq(group* g, int admin, vector_int* members, int maxgroupsize)
 	return g->gid;
 }
 
-bool isMember(group* g, int uid, int numclients)
+bool isMember(group* g, int uid)
 {
 	for (int i = 0; i < numclients; i++)
 	{
@@ -207,7 +290,7 @@ bool isMember(group* g, int uid, int numclients)
 	return false;
 }
 
-bool isAdmin(group* g, int uid, int numclients)
+bool isAdmin(group* g, int uid)
 {
 	for (int i = 0; i < numclients; i++)
 	{
@@ -220,15 +303,15 @@ bool isAdmin(group* g, int uid, int numclients)
 	return false;
 }
 
-int addMember(group* g, int admin, int uid, int numclients)
+int addMember(group* g, int admin, int uid)
 {
-	if (!isAdmin(g, admin, numclients))
+	if (!isAdmin(g, admin))
 	{
 		// no privileges
 		return -3;
 	}
 
-	if (isMember(g, uid, numclients))
+	if (isMember(g, uid))
 	{
 		// client is already a member
 		return -1;
@@ -247,21 +330,21 @@ int addMember(group* g, int admin, int uid, int numclients)
 	return -2;
 }
 
-int addAdmin(group* g, int admin, int uid, int numclients)
+int addAdmin(group* g, int admin, int uid)
 {
-	if (!isAdmin(g, admin, numclients))
+	if (!isAdmin(g, admin))
 	{
 		// no privileges
 		return -3;
 	}
 
-	if (!isMember(g, uid, numclients))
+	if (!isMember(g, uid))
 	{
 		// client is not a member
 		return -1;
 	}
 
-	if (isAdmin(g, uid, numclients))
+	if (isAdmin(g, uid))
 	{
 		// client is already an admin
 		return -2;
@@ -280,15 +363,15 @@ int addAdmin(group* g, int admin, int uid, int numclients)
 	return -2;
 }
 
-int removeMember(group* g, int admin, int uid, int numclients)
+int removeMember(group* g, int admin, int uid)
 {
-	if (!isAdmin(g, admin, numclients))
+	if (!isAdmin(g, admin))
 	{
 		// no privileges
 		return -3;
 	}
 
-	if (!isMember(g, uid, numclients))
+	if (!isMember(g, uid))
 	{
 		// client is not a member
 		return -1;
@@ -313,7 +396,7 @@ int removeMember(group* g, int admin, int uid, int numclients)
 	return 0;
 }
 
-int getGroupSize(group* g, int maxgroupsize)
+int getGroupSize(group* g)
 {
 	int size = 0;
 	for (int i = 0; i < maxgroupsize; i++)
@@ -327,7 +410,7 @@ int getGroupSize(group* g, int maxgroupsize)
 	return size;
 }
 
-int getGroupIndex(int gid, group groups[], int numgroups)
+int getGroupIndex(int gid)
 {
 	for (int i = 0; i < numgroups; i++)
 	{
@@ -340,9 +423,9 @@ int getGroupIndex(int gid, group groups[], int numgroups)
 	return -1;
 }
 
-int makeBroadcastOnly(group* g, int admin, int numclients)
+int makeBroadcastOnly(group* g, int admin)
 {
-	if (!isAdmin(g, admin, numclients))
+	if (!isAdmin(g, admin))
 	{
 		// client is not an admin
 		return -1;
@@ -368,23 +451,21 @@ void ActivateGroup(group* g)
 	free_vector_int(&g->replies);
 }
 
-/*Function to handle ^C*/
+// function to handle ^C*
 void sigCHandler() 
 { 
-	//WRITE YOUR CODE HERE
+	cleanup();
 	exit(0);
 } 
 
-/*Function to handle ^Z*/
+// function to handle ^Z
 void sigZhandler() 
-{ 
-	//WRITE YOUR CODE HERE
+{
+	cleanup();
 	exit(0);
 }
 
-/*FUNCTIONS BELOW HANLES ALL SORT OF MESSAGE QUERIES FROM CLIENT*/
-
-int getMaxFd(int sockfd, int numclients, client clients[])
+int getMaxFd()
 {
 	int fdmax = 0;
 	for (int j = 0; j < numclients; j++)
@@ -396,24 +477,77 @@ int getMaxFd(int sockfd, int numclients, client clients[])
 	return fdmax;
 }
 
-bool writeToClient(int i, int numclients, int* numconnections, client clients[], 
-				   int sockfd, int* fdmax, char buffer[], fd_set* master,
-				   int numgroups, int maxgroupsize, group* groups);
+int getIndexForNewGroup()
+{
+	int i;
+	for (i = 0; i < numgroups; i++)
+	{
+		if (groups[i].status == offline)
+		{
+			return i;
+		}
+	}
 
-void removeClient(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, fd_set* master,
-                  int numgroups, int maxgroupsize, group* groups)
+	return -1;
+}
+
+int getIndexForNewGroupInClient(client* c)
+{
+	for (int i = 0; i < numgroups; i++)
+	{
+		if (c->groups[i] == -1)
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+int getClientIndex(int cid)
+{
+	for (int i = 0; i < numclients; i++)
+	{
+		if (clients[i].uid != -1 && clients[i].uid == cid)
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+int getIndexForNewClient()
+{
+	int i;
+	for (i = 0; i < numclients; i++)
+	{
+		if (clients[i].active == false)
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+bool writeToClient(int i, char buffer[]);
+
+void removeClient(int i)
 {
 	// remove the fd from set
-	FD_CLR(clients[i].sockfd, master);
+	FD_CLR(clients[i].sockfd, &master);
+
+	clients[i].sockfd = -1;
 
 	// find max fd value
-	*fdmax = getMaxFd(sockfd, numclients, clients);
+	fdmax = getMaxFd();
 
 	// mark the slot empty
 	clients[i].active = false;
 	
 	// decrement number of active clients
-	(*numconnections)--;
+	numconnections--;
 
 	// remove client from all groups
 	for (int j = 0; j < numgroups; j++)
@@ -424,7 +558,7 @@ void removeClient(int i, int numclients, int* numconnections, client clients[], 
 			continue;
 		}
 
-		int g = getGroupIndex(gid, groups, numgroups);
+		int g = getGroupIndex(gid);
 		
 		for (int k = 0; k < maxgroupsize; k++)
 		{
@@ -442,7 +576,7 @@ void removeClient(int i, int numclients, int* numconnections, client clients[], 
 			{
 				char out[256];
 				sprintf(out, "client %d left the group %d.\n", clients[i].uid, groups[g].gid);
-				writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+				writeToClient(client, out);
 			}
 		}
 
@@ -486,7 +620,7 @@ void removeClient(int i, int numclients, int* numconnections, client clients[], 
 					}
 				}
 
-				writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+				writeToClient(client, out);
 				groups[g].members[k] = -1;
 			}
 			free_vector_adminreq(&groups[g].adminreqs);
@@ -498,22 +632,25 @@ void removeClient(int i, int numclients, int* numconnections, client clients[], 
 }
 
 // sends buffer of size 256 chars
-bool writeToClient(int i, int numclients, int* numconnections, client clients[], 
-				   int sockfd, int* fdmax, char buffer[], fd_set* master,
-				   int numgroups, int maxgroupsize, group* groups)
+bool writeToClient(int i, char buffer[])
 {
 	// printf("sending: %s\n", buffer);
 	if (write(clients[i].sockfd, buffer, strlen(buffer)) == -1)
 	{
-		removeClient(i, numclients, numconnections, clients, sockfd, fdmax, master, numgroups, maxgroupsize, groups);
+		removeClient(i);
 		return false;
 	}
 
 	return true;
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////
+// Client command functions
+
 /* function to processs messages from clients*/
-void sendMsg(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void sendMsg(int i, char buffer[])
 {
 	//WRITE YOUR CODE HERE
 	char out[256];
@@ -524,7 +661,7 @@ void sendMsg(int i, int numclients, int* numconnections, client clients[], int s
 	{
 		// handle error
 		strcpy(out, "server: client id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -533,7 +670,7 @@ void sendMsg(int i, int numclients, int* numconnections, client clients[], int s
 	{
 		// handle error
 		strcpy(out, "server: invalid client id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -543,11 +680,11 @@ void sendMsg(int i, int numclients, int* numconnections, client clients[], int s
 		if (i != j && clients[j].active && clients[j].uid == destclient)
 		{
 			//write(clients[j].sockfd, out, sizeof(out));
-			if (!writeToClient(j, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups))
+			if (!writeToClient(j, out))
 			{
 				// client disconnected
 				sprintf(out, "server: client %d disconnected", clients[j].uid);
-				writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+				writeToClient(i, out);
 			}
 			
 			return;
@@ -556,13 +693,11 @@ void sendMsg(int i, int numclients, int* numconnections, client clients[], int s
 
 	// handle client not found
 	sprintf(out, "server: client %d disconnected", destclient);
-	writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+	writeToClient(i, out);
 }
 
-/*FUCTION TO HANDLE BROADCAST REQUEST*/
-void broadcast(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void broadcast(int i, char buffer[])
 {
-	//WRITE YOUR CODE HERE
 	char out[256];
 	sprintf(out, "client %d broadcast: ", clients[i].uid);
 	strcat(out, buffer);
@@ -570,39 +705,12 @@ void broadcast(int i, int numclients, int* numconnections, client clients[], int
 	{
 		if (clients[j].active)
 		{
-			writeToClient(j, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(j, out);
 		}
 	}
 }
 
-int getIndexForNewGroup(int numgroups, group groups[])
-{
-	int i;
-	for (i = 0; i < numgroups; i++)
-	{
-		if (groups[i].status == offline)
-		{
-			return i;
-		}
-	}
-
-	return -1;
-}
-
-int getIndexForNewGroupInClient(client* c, int numgroups)
-{
-	for (int i = 0; i < numgroups; i++)
-	{
-		if (c->groups[i] == -1)
-		{
-			return i;
-		}
-	}
-
-	return -1;
-}
-
-void makeGroup(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void makeGroup(int i, char buffer[])
 {
 	// to store indices of clients[]
 	int* members = (int*)calloc(maxgroupsize, sizeof(int));
@@ -618,7 +726,7 @@ void makeGroup(int i, int numclients, int* numconnections, client clients[], int
 			// invalid client id provided
 			char out[256];
 			sprintf(out, "server: invalid client id provided.");
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
@@ -636,7 +744,7 @@ void makeGroup(int i, int numclients, int* numconnections, client clients[], int
 			// client does not exist
 			char out[256];
 			sprintf(out, "client %d does not exist.", clientid);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
@@ -648,7 +756,7 @@ void makeGroup(int i, int numclients, int* numconnections, client clients[], int
 		// max group size limit is 5
 		char out[256];
 		sprintf(out, "server: max group size limit is %d.", maxgroupsize);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -658,12 +766,12 @@ void makeGroup(int i, int numclients, int* numconnections, client clients[], int
 		// all groups are filled
 		char out[256];
 		sprintf(out, "server: all groups are filled.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
 	// create the group
-	int gid = initGroup(&groups[index], i, members, maxgroupsize);
+	int gid = initGroup(&groups[index], i, members);
 
 	// send responses
 	char out[256];
@@ -678,25 +786,25 @@ void makeGroup(int i, int numclients, int* numconnections, client clients[], int
 		int client = groups[index].members[j];
 
 		// set gid in client
-		int index = getIndexForNewGroupInClient(&clients[client], numgroups);
+		int index = getIndexForNewGroupInClient(&clients[client]);
 		if (index == -1)
 		{
 			// should never happen!
 			// client already joined max number of groups
 			char out[256];
 			sprintf(out, "client %d already joined max number of groups.", client);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			continue;
 		}
 		clients[client].groups[index] = gid;
 
-		writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(client, out);
 	}
 	
 	free(members);
 }
 
-void sendGroup(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void sendGroup(int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -704,7 +812,7 @@ void sendGroup(int i, int numclients, int* numconnections, client clients[], int
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -714,36 +822,36 @@ void sendGroup(int i, int numclients, int* numconnections, client clients[], int
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int group = getGroupIndex(gid, groups, numgroups);
+	int group = getGroupIndex(gid);
 	if (group == -1)
 	{
 		// group does not exist
 		char out[256];
 		strcpy(out, "server: group does not exist.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	if (!isMember(&groups[group], i, maxgroupsize))
+	if (!isMember(&groups[group], i))
 	{
 		// client is not a member
 		char out[256];
 		sprintf(out, "server: You are not a member of group %d.", gid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
 	// check if the group is broadcast only
-	if (groups[group].broadcastOnly && !isAdmin(&groups[group], i, maxgroupsize))
+	if (groups[group].broadcastOnly && !isAdmin(&groups[group], i))
 	{
 		// client is not a member
 		char out[256];
 		sprintf(out, "server: Only admins can send messages in a broadcast only group.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -761,11 +869,11 @@ void sendGroup(int i, int numclients, int* numconnections, client clients[], int
 			continue;
 		}
 		
-		writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(client, out);
 	}
 }
 
-void activeGroup(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void activeGroup(int i, char buffer[])
 {
 	char out[256];
 	strcpy(out, "server: ");
@@ -787,23 +895,10 @@ void activeGroup(int i, int numclients, int* numconnections, client clients[], i
 		strcat(out, "You are not in any groups.");
 	}
 
-	writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+	writeToClient(i, out);
 }
 
-int getClientIndex(int cid, client clients[], int numclients)
-{
-	for (int i = 0; i < numclients; i++)
-	{
-		if (clients[i].uid != -1 && clients[i].uid == cid)
-		{
-			return i;
-		}
-	}
-
-	return -1;
-}
-
-void makeAdmin(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void makeAdmin(int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -811,7 +906,7 @@ void makeAdmin(int i, int numclients, int* numconnections, client clients[], int
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -821,17 +916,17 @@ void makeAdmin(int i, int numclients, int* numconnections, client clients[], int
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int g = getGroupIndex(gid, groups, numgroups);
+	int g = getGroupIndex(gid);
 	if (g == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: group does not exists.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -841,7 +936,7 @@ void makeAdmin(int i, int numclients, int* numconnections, client clients[], int
 		// handle error
 		char out[256];
 		strcpy(out, "server: client id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -851,51 +946,51 @@ void makeAdmin(int i, int numclients, int* numconnections, client clients[], int
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid client id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int c = getClientIndex(cid, clients, numclients);
+	int c = getClientIndex(cid);
 	if (c == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: client does not exist.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int res = addAdmin(&groups[g], i, c, maxgroupsize);
+	int res = addAdmin(&groups[g], i, c);
 	if (res == -3)
 	{
 		// no privileges
 		char out[256];
 		strcpy(out, "server: !!You are not an admin!!");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 	}
 	else if (res == -1)
 	{
 		// client is not a member
 		char out[256];
 		sprintf(out, "server: client %d is not a member of group %d.", cid, gid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 	}
 	else if (res == -2)
 	{
 		// client is already an admin
 		char out[256];
 		sprintf(out, "server: client %d is already an admin of group %d.", cid, gid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 	}
 	else
 	{
 		char out[256];
 		sprintf(out, "server: You are now an admin of group %d.", gid);
-		writeToClient(c, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(c, out);
 	}
 }
 
-void addToGroup(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void addToGroup(int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -903,7 +998,7 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -913,17 +1008,17 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int g = getGroupIndex(gid, groups, numgroups);
+	int g = getGroupIndex(gid);
 	if (g == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: group does not exists.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -933,7 +1028,7 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 
 	char token[256];
 	int j = 0;
-	int slotsLeft = maxgroupsize - getGroupSize(&groups[g], maxgroupsize);
+	int slotsLeft = maxgroupsize - getGroupSize(&groups[g]);
 	while (j < slotsLeft && getNext(&buffer, token))
 	{
 		int clientid;
@@ -942,7 +1037,7 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 			// invalid client id provided
 			char out[256];
 			sprintf(out, "server: invalid client id provided.");
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
@@ -960,7 +1055,7 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 			// client does not exist
 			char out[256];
 			sprintf(out, "client %d does not exist.", clientid);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
@@ -972,7 +1067,7 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 		// max group size limit is 5
 		char out[256];
 		sprintf(out, "server: max group size limit is %d, current group size: %d.", maxgroupsize, maxgroupsize - slotsLeft);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -984,13 +1079,13 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 		}
 
 		int client = members[j];
-		int res = addMember(&groups[g], i, client, maxgroupsize);
+		int res = addMember(&groups[g], i, client);
 		if (res == -3)
 		{
 			// no privileges
 			char out[256];
 			sprintf(out, "server: !!You are not an admin!!");
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 		else if (res == -1)
@@ -998,7 +1093,7 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 			// already a member
 			char out[256];
 			sprintf(out, "server: client %d is already a member.", clients[client].uid);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			continue;
 		}
 		else if (res == -2)
@@ -1006,7 +1101,7 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 			// group is full -> should never come here!
 			char out[256];
 			sprintf(out, "server: group %d is full.", gid);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 		else
@@ -1014,28 +1109,28 @@ void addToGroup(int i, int numclients, int* numconnections, client clients[], in
 			// send responses to the client added
 
 			// set gid in client
-			int index = getIndexForNewGroupInClient(&clients[client], numgroups);
+			int index = getIndexForNewGroupInClient(&clients[client]);
 			if (index == -1)
 			{
 				// should never happen!
 				// client already joined max number of groups
 				char out[256];
 				sprintf(out, "client %d already joined max number of groups.", client);
-				writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+				writeToClient(i, out);
 				continue;
 			}
 			clients[client].groups[index] = gid;
 
 			char out[256];
 			sprintf(out, "You have been added to group %d.", gid);
-			writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(client, out);
 		}
 	}
 
 	free(members);
 }
 
-void makeGroupBroadcast(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void makeGroupBroadcast(int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -1043,7 +1138,7 @@ void makeGroupBroadcast(int i, int numclients, int* numconnections, client clien
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1053,26 +1148,26 @@ void makeGroupBroadcast(int i, int numclients, int* numconnections, client clien
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int g = getGroupIndex(gid, groups, numgroups);
+	int g = getGroupIndex(gid);
 	if (g == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: group does not exists.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	if (makeBroadcastOnly(&groups[g], i, maxgroupsize) == -1)
+	if (makeBroadcastOnly(&groups[g], i) == -1)
 	{
 		// client is not an admin
 		char out[256];
 		strcpy(out, "server: !!You are not an admin!!");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 	}
 	else
 	{
@@ -1085,12 +1180,12 @@ void makeGroupBroadcast(int i, int numclients, int* numconnections, client clien
 			}
 			char out[256];
 			sprintf(out, "server: group %d is now broadcast only.", gid);
-			writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(client, out);
 		}
 	}
 }
 
-void makeGroupReq(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void makeGroupReq(int i, char buffer[])
 {
 	// to store indices of clients[]
 	vector_int members = vector(int);
@@ -1106,18 +1201,18 @@ void makeGroupReq(int i, int numclients, int* numconnections, client clients[], 
 			// invalid client id provided
 			char out[256];
 			sprintf(out, "server: invalid client id provided.");
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
-		int k = getClientIndex(cid, clients, numclients);
+		int k = getClientIndex(cid);
 
 		if (k == numclients)
 		{
 			// client does not exist
 			char out[256];
 			sprintf(out, "client %d does not exist.", cid);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
@@ -1129,7 +1224,7 @@ void makeGroupReq(int i, int numclients, int* numconnections, client clients[], 
 		// max group size limit is 5
 		char out[256];
 		sprintf(out, "server: max group size limit is %d.", maxgroupsize);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1139,22 +1234,24 @@ void makeGroupReq(int i, int numclients, int* numconnections, client clients[], 
 	{
 		// no indices left for a new group
 		// should never come here
+		cleanup();
+		exit(1);
 	}
 
-	int gid = initGroupReq(&groups[g], i, &members, maxgroupsize);
+	int gid = initGroupReq(&groups[g], i, &members);
 
 	char out[256];
 	sprintf(out, "You are requested by client %d to join group %d.", clients[i].uid, gid);
 	for (int j = 1; j < members.size; j++)
 	{
 		int client = members.a[j];
-		writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(client, out);
 	}
 
 	free_vector_int(&members);
 }
 
-void replyGroupReq(int reply, int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void replyGroupReq(int reply, int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -1162,7 +1259,7 @@ void replyGroupReq(int reply, int i, int numclients, int* numconnections, client
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1172,17 +1269,17 @@ void replyGroupReq(int reply, int i, int numclients, int* numconnections, client
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int g = getGroupIndex(gid, groups, numgroups);
+	int g = getGroupIndex(gid);
 	if (g == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: group does not exists.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1200,7 +1297,7 @@ void replyGroupReq(int reply, int i, int numclients, int* numconnections, client
 		// handle error
 		char out[256];
 		sprintf(out, "server: You were not requested for joining group %d.", gid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1231,24 +1328,24 @@ void replyGroupReq(int reply, int i, int numclients, int* numconnections, client
 			}
 
 			// set gid in client
-			int index = getIndexForNewGroupInClient(&clients[client], numgroups);
+			int index = getIndexForNewGroupInClient(&clients[client]);
 			if (index == -1)
 			{
 				// should never happen!
 				// client already joined max number of groups
 				char out[256];
 				sprintf(out, "client %d already joined max number of groups.", client);
-				writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+				writeToClient(i, out);
 				continue;
 			}
 			clients[client].groups[index] = gid;
 
-			writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(client, out);
 		}
 	}
 }
 
-void removeFromGroup(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void removeFromGroup(int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -1256,7 +1353,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1266,17 +1363,17 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int g = getGroupIndex(gid, groups, numgroups);
+	int g = getGroupIndex(gid);
 	if (g == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: group does not exists.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1294,7 +1391,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 			// invalid client id provided
 			char out[256];
 			sprintf(out, "server: invalid client id provided.");
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
@@ -1312,7 +1409,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 			// client does not exist
 			char out[256];
 			sprintf(out, "client %d does not exist.", clientid);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 
@@ -1324,7 +1421,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 		// max group size limit is 5
 		char out[256];
 		sprintf(out, "server: max group size limit is %d.", maxgroupsize);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1336,13 +1433,13 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 		}
 
 		int client = members[j];
-		int res = removeMember(&groups[g], i, client, maxgroupsize);
+		int res = removeMember(&groups[g], i, client);
 		if (res == -3)
 		{
 			// no privileges
 			char out[256];
 			sprintf(out, "server: !!You are not an admin!!");
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			return;
 		}
 		else if (res == -1)
@@ -1350,7 +1447,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 			// not a member
 			char out[256];
 			sprintf(out, "server: client %d is not a member of group %d.", clients[client].uid, gid);
-			writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(i, out);
 			continue;
 		}
 		else
@@ -1369,7 +1466,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 
 			char out[256];
 			sprintf(out, "You have been removed from the group %d by client %d.", gid, clients[i].uid);
-			writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+			writeToClient(client, out);
 
 			bool allAdminsInactive = true;
 			for (int k = 0; k < maxgroupsize; k++)
@@ -1401,7 +1498,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 						}
 					}
 
-					writeToClient(client, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+					writeToClient(client, out);
 					groups[g].members[k] = -1;
 				}
 				groups[g].status = offline;
@@ -1412,7 +1509,7 @@ void removeFromGroup(int i, int numclients, int* numconnections, client clients[
 	free(members);
 }
 
-void makeAdminReq(int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void makeAdminReq(int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -1420,7 +1517,7 @@ void makeAdminReq(int i, int numclients, int* numconnections, client clients[], 
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1430,35 +1527,35 @@ void makeAdminReq(int i, int numclients, int* numconnections, client clients[], 
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int g = getGroupIndex(gid, groups, numgroups);
+	int g = getGroupIndex(gid);
 	if (g == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: group does not exists.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
 	char out[256];
 	sprintf(out, "server: client %d has requested to be an admin for group %d.", clients[i].uid, gid);
 
-	if (!isMember(&groups[g], i, maxgroupsize))
+	if (!isMember(&groups[g], i))
 	{
 		sprintf(out, "server: You are not a member of the group %d.", gid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	if (isAdmin(&groups[g], i, maxgroupsize))
+	if (isAdmin(&groups[g], i))
 	{
 		// client is already an admin
 		sprintf(out, "server: You are already an admin of the group %d.", gid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1472,13 +1569,13 @@ void makeAdminReq(int i, int numclients, int* numconnections, client clients[], 
 		}
 		push_back_int(&req.admins, admin);
 
-		writeToClient(admin, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(admin, out);
 	}
 	req.replies = init_vector(int, req.admins.size, -1);
 	push_back_adminreq(&groups[g].adminreqs, req);
 }
 
-void replyAdminReq(int reply, int i, int numclients, int* numconnections, client clients[], int sockfd, int* fdmax, char buffer[], fd_set* master, int numgroups, int maxgroupsize, group* groups)
+void replyAdminReq(int reply, int i, char buffer[])
 {
 	char gid_s[256];
 	if (!getNext(&buffer, gid_s))
@@ -1486,7 +1583,7 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 		// handle error
 		char out[256];
 		strcpy(out, "server: group id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1496,17 +1593,17 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid group id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int g = getGroupIndex(gid, groups, numgroups);
+	int g = getGroupIndex(gid);
 	if (g == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: group does not exists.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1516,7 +1613,7 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 		// handle error
 		char out[256];
 		strcpy(out, "server: client id not provided");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1526,17 +1623,17 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 		// handle error
 		char out[256];
 		strcpy(out, "server: invalid client id");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
-	int c = getClientIndex(cid, clients, numclients);
+	int c = getClientIndex(cid);
 	if (c == -1)
 	{
 		// handle error
 		char out[256];
 		strcpy(out, "server: client does not exist.");
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1554,7 +1651,7 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 	{
 		char out[256];
 		sprintf(out, "server: group %d has no admin request from client %d.", gid, cid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1572,7 +1669,7 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 	{
 		char out[256];
 		sprintf(out, "server: You were not requested for admin approval of client %d for group %d.", cid, gid);
-		writeToClient(i, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return;
 	}
 
@@ -1602,7 +1699,7 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 		char out[256];
 		if (approvals >= (groups[g].adminreqs.a[index].replies.size + 1) / 2)
 		{
-			int res = addAdmin(&groups[g], i, c, maxgroupsize);
+			int res = addAdmin(&groups[g], i, c);
 			if (res == -3)
 			{
 				// no privileges
@@ -1627,7 +1724,7 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 		{
 			sprintf(out, "server: Your admin request for the group %d was rejected.", gid);
 		}
-		writeToClient(c, numclients, numconnections, clients, sockfd, fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(c, out);
 
 		// free
 		free_vector_int(&groups[g].adminreqs.a[index].admins);
@@ -1636,21 +1733,25 @@ void replyAdminReq(int reply, int i, int numclients, int* numconnections, client
 	}
 }
 
-/*Function to handle all the commands as entered by the client*/ 
-int performAction(int i, int numclients, int* numconnections, client clients[], int sockfd, int fdmax, char* buffer, fd_set* master, int numgroups, int maxgroupsize, group* groups)
+///////////////////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////////////////
+// Functions to process client message
+
+int performAction(int i, char* buffer)
 {
 	char command[256];
 	if (!getNext(&buffer, command))
 	{
 		char out[256];
 		strcpy(out, "server: invalid command");
-		writeToClient(i, numclients, numconnections, clients, sockfd, &fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 		return fdmax;
 	}
 
 	if (strcmp(command, "/quit\n") == 0)
 	{
-		removeClient(i, numclients, numconnections, clients, sockfd, &fdmax, master, numgroups, maxgroupsize, groups);
+		removeClient(i);
 		
 		printf("client %d left the chat.\n", i + 1);
 	}
@@ -1677,132 +1778,122 @@ int performAction(int i, int numclients, int* numconnections, client clients[], 
 		}
 
 		// send to client
-		writeToClient(i, numclients, numconnections, clients, sockfd, &fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 	}
 
 	else if (strcmp(command, "/broadcast") == 0)
 	{
-		broadcast(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		broadcast(i, buffer);
 	}
 
 	else if (strcmp(command, "/send") == 0)
 	{
-		sendMsg(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		sendMsg(i, buffer);
 	}
 
 	else if (strcmp(command, "/makegroup") == 0)
 	{
-		makeGroup(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		makeGroup(i, buffer);
 	}
 
 	else if (strcmp(command, "/sendgroup") == 0)
 	{
-		sendGroup(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		sendGroup(i, buffer);
 	}
 
 	else if (strcmp(command, "/activegroups\n") == 0)
 	{
-		activeGroup(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		activeGroup(i, buffer);
 	}
 
 	else if (strcmp(command, "/makeadmin") == 0)
 	{
-		makeAdmin(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		makeAdmin(i, buffer);
 	}
 
 	else if (strcmp(command, "/addtogroup") == 0)
 	{
-		addToGroup(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		addToGroup(i, buffer);
 	}
 	
 	else if (strcmp(command, "/makegroupbroadcast") == 0)
 	{
-		makeGroupBroadcast(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		makeGroupBroadcast(i, buffer);
 	}
 
 	else if (strcmp(command, "/makegroupreq") == 0)
 	{
-		makeGroupReq(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		makeGroupReq(i, buffer);
 	}
 
 	else if (strcmp(command, "/joingroup") == 0)
 	{
-		replyGroupReq(1, i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		replyGroupReq(1, i, buffer);
 	}
 
 	else if (strcmp(command, "/declinegroup") == 0)
 	{
-		replyGroupReq(0, i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		replyGroupReq(0, i, buffer);
 	}
 
 	else if (strcmp(command, "/removefromgroup") == 0)
 	{
-		removeFromGroup(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		removeFromGroup(i, buffer);
 	}
 
 	else if (strcmp(command, "/makeadminreq") == 0)
 	{
-		makeAdminReq(i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		makeAdminReq(i, buffer);
 	}
 
 	else if (strcmp(command, "/approveadminreq") == 0)
 	{
-		replyAdminReq(1, i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		replyAdminReq(1, i, buffer);
 	}
 
 	else if (strcmp(command, "/declineadminreq") == 0)
 	{
-		replyAdminReq(0, i, numclients, numconnections, clients, sockfd, &fdmax, buffer, master, numgroups, maxgroupsize, groups);
+		replyAdminReq(0, i, buffer);
 	}
 
 	else
 	{
 		char out[256];
 		sprintf(out, "server: invalid command");
-		writeToClient(i, numclients, numconnections, clients, sockfd, &fdmax, out, master, numgroups, maxgroupsize, groups);
+		writeToClient(i, out);
 	}
 
 	return fdmax;
 }
 
 
-int processClient(int i, int numclients, int* numconnections, client clients[], int sockfd, int fdmax, fd_set* master, int numgroups, int maxgroupsize, group* groups)
+int processClient(int i)
 {
 	char buffer[256];
 	// receive message from client
 	recv(clients[i].sockfd, buffer, 256, 0);
 	// printf("recvd from client %d: %s\n", i + 1, buffer);
 
-	return performAction(i, numclients, numconnections, clients, sockfd, fdmax, buffer, master, numgroups, maxgroupsize, groups);
+	return performAction(i, buffer);
 }
 
-int getIndexForNewClient(int numclients, client clients[])
-{
-	int i;
-	for (i = 0; i < numclients; i++)
-	{
-		if (clients[i].active == false)
-		{
-			return i;
-		}
-	}
+///////////////////////////////////////////////////////////////////////////////////////////
 
-	return -1;
-}
+///////////////////////////////////////////////////////////////////////////////////////////
+// Init functions
 
-int registerClient(int numclients, int sockfd, int newsockfd, client clients[], int fdmax, fd_set* master)
+int registerClient(int newsockfd)
 {
 	// get position for new client
-	
-	int i = getIndexForNewClient(numclients, clients);
+	int i = getIndexForNewClient();
 	clients[i].active = true;
 	clients[i].sockfd = newsockfd;
 	clients[i].uid = rand() % 89999 + 10000;
 	
 	// find max fd value
-	fdmax = getMaxFd(sockfd, numclients, clients);
+	fdmax = getMaxFd();
 	
-	FD_SET(clients[i].sockfd, master);
+	FD_SET(clients[i].sockfd, &master);
 
 	char out[256];
 	sprintf(out, "server: %d", clients[i].uid);
@@ -1813,24 +1904,34 @@ int registerClient(int numclients, int sockfd, int newsockfd, client clients[], 
 	return fdmax;
 }
 
-int main(int argc, char *argv[])
+void initClients()
 {
-	srand(time(0)); /*seeding the rand() function*/
-	
-	signal(SIGINT, sigCHandler);  // handles ^C
-	signal(SIGTSTP, sigZhandler);    //handles ^Z
-	
-	char port[10];
-	strcpy(port, "5000");
-	if (argc == 2) 
+	clients = (client*)calloc(numclients, sizeof(client));
+	for (int i = 0; i < numclients; i++)
 	{
-		strcpy(port, argv[1]);
+		clients[i].groups = (int*)calloc(numgroups, sizeof(int));
+		memset(clients[i].groups, -1, numgroups * sizeof(int));
 	}
+}
 
-	int sockfd, newsockfd, portno, clilen, pid,client_id,flags;
-	struct sockaddr_in serv_addr, cli_addr;
+void initGroups()
+{
+	groups = (group*)calloc(numgroups, sizeof(group));
+	for (int i = 0; i < numgroups; i++)
+	{
+		groups[i].admins  = (int*)calloc(maxgroupsize, sizeof(int));
+		groups[i].members = (int*)calloc(maxgroupsize, sizeof(int));
+		memset(groups[i].admins, -1, maxgroupsize * sizeof(int));
+		memset(groups[i].members, -1, maxgroupsize * sizeof(int));
+	}
+}
+
+void initServerSocket(char port[10])
+{
+	int portno, pid, flags;
+	struct sockaddr_in serv_addr;
 	  
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);  /*getting a sockfd for a TCP connection*/
+	sockfd = socket(AF_INET, SOCK_STREAM, 0);   // getting a sockfd for a TCP connection
 	if (sockfd < 0)  perror("ERROR opening socket");
 
 	int optval = 1;
@@ -1850,79 +1951,74 @@ int main(int argc, char *argv[])
 	bzero((char *) &serv_addr, sizeof(serv_addr));
 
 	portno = atoi(port);
-	serv_addr.sin_family = AF_INET; /*symbolic constant for IPv4 address*/
-	serv_addr.sin_addr.s_addr = INADDR_ANY; /*symbolic constant for holding IP address of the server*/
+	serv_addr.sin_family = AF_INET;  // symbolic constant for IPv4 address
+	serv_addr.sin_addr.s_addr = INADDR_ANY;  // symbolic constant for holding IP address of the server
 	serv_addr.sin_port = htons(portno);
 
-	if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0){
+	if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0)
+	{
 		perror("ERROR on binding");
  	}
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+int main(int argc, char *argv[])
+{
+	srand(time(0));
+	
+	signal(SIGINT, sigCHandler);
+	signal(SIGTSTP, sigZhandler);
+
+	char port[10] = "5000";
+	if (argc == 2)
+	{
+		strcpy(port, argv[1]);
+	}
+	initServerSocket(port);
+
+	initClients();
+	initGroups();
  	
- 	/*Initialize all the data structures and the semaphores you will need for handling the client requests*/
-	int numclients = 10;
-	int numconnections = 0;
+	// setup server to listen
  	listen(sockfd, numclients);
-	fd_set master;
+
+	// init clint socket file descriptors
 	fd_set readfds;
  	FD_ZERO(&readfds);
 
 	// intercept on a new connection
 	FD_SET(sockfd, &master);
-	FD_SET(sockfd, &readfds);
 
 	// client sockfds
-	client* clients = (client*)calloc(numclients, sizeof(client));
-
-	// groups
-	int numgroups = 10;
-	int maxgroupsize = 5;
-	group* groups = (group*)calloc(numgroups, sizeof(group));
-	for (int i = 0; i < numgroups; i++)
-	{
-		groups[i].admins  = (int*)calloc(maxgroupsize, sizeof(int));
-		groups[i].members = (int*)calloc(maxgroupsize, sizeof(int));
-		memset(groups[i].admins, -1, maxgroupsize * sizeof(int));
-		memset(groups[i].members, -1, maxgroupsize * sizeof(int));
-	}
-
-	for (int i = 0; i < numclients; i++)
-	{
-		clients[i].groups = (int*)calloc(numgroups, sizeof(int));
-		memset(clients[i].groups, -1, numgroups * sizeof(int));
-	}
-
-	int fdmax = sockfd;
+	fdmax = sockfd;
 
 	// the n param in select()
 	int n = fdmax + 1;
 
-	while (1) {
-		
-		/*Write appropriate code to set up fd_set to be used in the select call. Following is a rough outline of what needs to be done here	
-			-Calling FD_ZERO
-			-Calling FD_SET
-			-identifying highest fd for using it in select call
-		*/
-
+	// main loop
+	while (1) 
+	{
 		readfds = master;  // copy
-		int activity = select(n, &readfds, NULL, NULL, NULL); //give appropriate parameters
+		int activity = select(n, &readfds, NULL, NULL, NULL);  //give appropriate parameters
 		
-		if((activity< 0)&&(errno != 0)) //fill appropriate parameters here
+		if((activity< 0)&&(errno != 0))  //fill appropriate parameters here
 		{
-			perror("!!ERROR ON SELECT!!");
+			perror("select");
 		}
-		
-		/*After successful select call you can now monitor these two scenarios in a non-blocking fashion:
-			- A new connection is established, and
-			- An existing client has made some request
-		  You have to handle both these scenarios after line 191.
-		*/
-
 		else
 		{
+			/*
+			  After successful select call we can now monitor these two scenarios in a non-blocking fashion:
+				- A new connection is established, and
+				- An existing client has made some request
+			*/
+
 			if (FD_ISSET(sockfd, &readfds))
 			{
-				newsockfd = accept(sockfd, (struct sockaddr *) &cli_addr, &clilen);
+				int clilen;
+				struct sockaddr_in cli_addr;
+				int newsockfd = accept(sockfd, (struct sockaddr *) &cli_addr, &clilen);
 				if (newsockfd >= 0) 
 				{
 					if (numconnections == numclients)
@@ -1934,8 +2030,8 @@ int main(int argc, char *argv[])
 					}
 
 					numconnections++;
-					fdmax = registerClient(numclients, sockfd, newsockfd, clients, fdmax, &master);
-					n = fdmax + 1;
+					fdmax = registerClient(newsockfd);
+					n = fdmax + 1;  // to accommodate new clinet
 				}
 				else
 				{
@@ -1947,13 +2043,13 @@ int main(int argc, char *argv[])
 			{
 				if (clients[i].active && FD_ISSET(clients[i].sockfd, &readfds))
 				{
-					fdmax = processClient(i, numclients, &numconnections, clients, sockfd, fdmax, &master, numgroups, maxgroupsize, groups);
-					n = fdmax + 1;
+					fdmax = processClient(i);
+					n = fdmax + 1;  // in case a clients disconnect
 				}
 			}
 		}
 
-	} /* end of while */
+	}
 	
-	return 0; /* we never get here */
+	return 0;
 }
